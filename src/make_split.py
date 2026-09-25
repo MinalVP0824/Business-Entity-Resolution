@@ -56,12 +56,13 @@ def main():
 
     gt = gt.merge(s1.rename(columns={"entity_id": "source1_entity_id"}),
                   on="source1_entity_id", how="left")
-    ids = gt["matched_entity_ids"].str.strip()
-    gt["n_matches"] = np.where(ids == "", 0, ids.str.count(",") + 1)
 
     # --------------------------------------------------------------- split
     # Sort first so the split does not depend on the file's row order.
+    # (ids is computed AFTER sorting so it stays aligned with the rows.)
     gt = gt.sort_values("source1_entity_id").reset_index(drop=True)
+    ids = gt["matched_entity_ids"].str.strip()
+    gt["n_matches"] = np.where(ids == "", 0, ids.str.count(",") + 1)
     rng = np.random.default_rng(args.seed)
     val_idx = rng.choice(len(gt), size=min(args.val_size, len(gt)), replace=False)
     gt["split"] = "train"
@@ -84,6 +85,15 @@ def main():
     links["matched_entity_id"] = links["matched_entity_id"].str.strip()
     links = links[links["matched_entity_id"].notna()
                   & (links["matched_entity_id"] != "")].reset_index(drop=True)
+    # sanity check: rebuilding the lists from links must give the original file
+    check = gt.loc[gt["n_matches"] > 0].sample(min(1000, int((gt["n_matches"] > 0).sum())),
+                                              random_state=0)
+    rebuilt = links[links["source1_entity_id"].isin(set(check["source1_entity_id"]))] \
+        .groupby("source1_entity_id")["matched_entity_id"].apply(lambda x: sorted(x))
+    original = check.set_index("source1_entity_id")["matched_entity_ids"] \
+        .apply(lambda x: sorted(v.strip() for v in x.split(",")))
+    assert (rebuilt.reindex(original.index) == original).all(), "links misaligned!"
+    log("sanity check passed: links match the ground truth file")
     links.to_parquet(os.path.join(out_dir, "gt_links.parquet"), index=False)
 
     # -------------------------------------------------------------- summary
