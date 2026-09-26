@@ -18,6 +18,10 @@ Usage (Kaggle):
     --skip-test    only train + validate (fast experiments)
     --skip-train   reuse the saved model and tuned parameters
     --stage2       two-stage re-ranker (see stage2.py); ~2x training time
+    --transitive   (with --stage2) add similarity-to-the-best-candidate features
+                   to the second stage
+    --source-thresholds   also try separate thresholds for Source 2 and
+                   Source 3 candidates of each country (kept only if better)
     --apply-only   no scoring at all: re-apply (new) post-processing settings to
                    the saved test_scores.parquet and rewrite matching_results.tsv
                    (takes a minute; use after changing thresholds)
@@ -45,8 +49,10 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from features import FEATURES, TextStore, compute_features  # noqa: E402
-from postprocess import f05_macro, select_matches, tune, tune_per_country  # noqa: E402
-from stage2 import SCORE_FEATURES, fold_of, score_group_features  # noqa: E402
+from postprocess import (f05_macro, select_matches, tune, tune_per_country,  # noqa: E402
+                         tune_per_country_source)
+from stage2 import (SCORE_FEATURES, TRANSITIVE_FEATURES, fold_of,  # noqa: E402
+                    score_group_features, transitive_features)
 
 START = time.time()
 KEEP_SCORE = 0.02   # test pairs below this score are never kept
@@ -70,6 +76,16 @@ def load_pairs(folder, store):
     return pairs, X
 
 
+def stage2_extra(pairs, s1_scores, transitive):
+    """Stage-2 extra features for one set of pairs from its stage-1 scores."""
+    s1_ids = pairs["s1_entity_id"].to_numpy()
+    parts = [score_group_features(s1_ids, s1_scores)]
+    if transitive:
+        parts.append(transitive_features(s1_ids, s1_scores, pairs["b_name_core"].to_numpy(),
+                                         pairs["b_addr_norm"].to_numpy()))
+    return pd.concat(parts, axis=1)
+
+
 def apply_params(scores, params):
     return select_matches(scores, params["threshold"], params["one_owner"],
                           params["top1_threshold"], params.get("country_thresholds"))
@@ -85,6 +101,8 @@ def train(args, model_dir):
     ytr = tr_pairs["label"].to_numpy()
     tr_s1 = tr_pairs["s1_entity_id"].to_numpy()
     log(f"train pairs: {len(Xtr):,} (positives {ytr.mean():.2%})")
+    # keep only what stage 2 needs from the training pairs
+    tr_keep = tr_pairs[["s1_entity_id", "b_name_core", "b_addr_norm"]].copy()
     del tr_pairs
 
     log("features for validation pairs ...")
@@ -126,15 +144,17 @@ def train(args, model_dir):
             m.save_model(os.path.join(model_dir, f"model_stage1_{k}.txt"))
             stage1.append(m)
         va_s1 = np.mean([m.predict(Xva, num_threads=nthreads) for m in stage1], axis=0)
-        # ---- stage 2: original features + score-context features
-        Xtr = pd.concat([Xtr.reset_index(drop=True), score_group_features(tr_s1, oof)], axis=1)
+        # ---- stage 2: original features + score-context (+ transitive) features
+        log("stage-2 features ...")
+        Xtr = pd.concat([Xtr.reset_index(drop=True),
+                         stage2_extra(tr_keep, oof, args.transitive)], axis=1)
         Xva = pd.concat([Xva.reset_index(drop=True),
-                         score_group_features(va_pairs["s1_entity_id"].to_numpy(), va_s1)], axis=1)
-        names = FEATURES + SCORE_FEATURES
+                         stage2_extra(va_pairs, va_s1, args.transitive)], axis=1)
+        names = FEATURES + SCORE_FEATURES + (TRANSITIVE_FEATURES if args.transitive else [])
         model = fit(Xtr, ytr, Xva, yva, names, "stage 2")
         model.save_model(os.path.join(model_dir, "model.txt"))
         va_score = model.predict(Xva, num_threads=nthreads)
-    del Xtr
+    del Xtr, tr_keep
 
     imp = pd.Series(model.feature_importance("gain"), index=names).sort_values(ascending=False)
     print("\nTop features by gain:")
@@ -174,6 +194,22 @@ def train(args, model_dir):
     else:
         print("-> keeping the single global threshold")
 
+    if args.source_thresholds:
+        log("tuning separate Source 2 / Source 3 thresholds per country ...")
+        src_t, res_s = tune_per_country_source(va_scores, links, val_ids, s1_country, best)
+        res_s.to_csv(os.path.join(model_dir, "tuning_source.csv"), index=False)
+        merged_t = dict(best.get("country_thresholds") or {}, **src_t)
+        with_src = dict(best, country_thresholds=merged_t)
+        f_before, _, _ = f05_macro(apply_params(va_scores, best), links, val_ids)
+        f_src, _, _ = f05_macro(apply_params(va_scores, with_src), links, val_ids)
+        print(f"\nPer-country-and-source thresholds: {src_t}")
+        print(f"Validation F0.5  before: {f_before:.4f}   with source thresholds: {f_src:.4f}")
+        if f_src > f_before:
+            best = with_src
+            print("-> using per-country-and-source thresholds")
+        else:
+            print("-> keeping the previous thresholds")
+
     matches = apply_params(va_scores, best)
     ent_country = pd.DataFrame({"id": val_ids, "country": val_ids.map(s1_country)})
     print("\nValidation F0.5 by country (final settings):")
@@ -187,6 +223,7 @@ def train(args, model_dir):
 
     best["val_f05"] = f
     best["stage2"] = bool(args.stage2)
+    best["transitive"] = bool(args.stage2 and args.transitive)
     with open(os.path.join(model_dir, "params.json"), "w") as fh:
         json.dump(best, fh, indent=2)
     log(f"saved model and params to {model_dir}")
@@ -236,7 +273,7 @@ def predict_test(args, model, best, model_dir):
             final, stage1 = model
             if stage1:
                 s1 = np.mean([m.predict(X, num_threads=os.cpu_count()) for m in stage1], axis=0)
-                X = pd.concat([X, score_group_features(pairs["s1_entity_id"].to_numpy(), s1)],
+                X = pd.concat([X, stage2_extra(pairs, s1, best.get("transitive", False))],
                               axis=1)
             pairs["score"] = final.predict(X, num_threads=os.cpu_count())
             kept.append(pairs.loc[pairs["score"] >= KEEP_SCORE,
@@ -295,7 +332,13 @@ def main():
     parser.add_argument("--stage2", action="store_true",
                         help="two-stage model: out-of-fold stage-1 scores + score-context "
                              "features feed a second LightGBM (re-ranker)")
+    parser.add_argument("--transitive", action="store_true",
+                        help="with --stage2: add similarity-to-best-candidate features")
+    parser.add_argument("--source-thresholds", action="store_true",
+                        help="also tune separate Source 2 / Source 3 thresholds per country")
     args = parser.parse_args()
+    if args.transitive and not args.stage2:
+        parser.error("--transitive needs --stage2")
 
     model_dir = os.path.join(args.work_dir, "model")
     os.makedirs(model_dir, exist_ok=True)
