@@ -14,6 +14,11 @@ select_matches() rules, applied in this order:
 
 Per-country tuning is exact: F0.5 is averaged per entity and matches never
 cross countries, so each country's threshold can be optimised on its own.
+
+country_thresholds may also hold "<country>|S2" / "<country>|S3" keys: a
+separate threshold for Source 2 and Source 3 candidates of that country
+(tune_per_country_source). Lookup order per pair: country|source, country,
+global.
 """
 
 import numpy as np
@@ -25,7 +30,12 @@ DEFAULT_THRESHOLDS = np.round(np.arange(0.3, 0.931, 0.025), 3)
 def _row_thresholds(scores, threshold, country_thresholds):
     if not country_thresholds or "country" not in scores.columns:
         return np.full(len(scores), threshold, dtype=np.float64)
-    return scores["country"].map(country_thresholds).fillna(threshold).to_numpy(np.float64)
+    thr = scores["country"].map(country_thresholds)
+    if any("|" in k for k in country_thresholds):
+        src = scores["candidate_entity_id"].str[:2]            # "S2" / "S3"
+        by_src = (scores["country"] + "|" + src).map(country_thresholds)
+        thr = by_src.fillna(thr)
+    return thr.fillna(threshold).to_numpy(np.float64)
 
 
 def select_matches(scores, threshold, one_owner=True, top1_threshold=None,
@@ -121,4 +131,43 @@ def tune_per_country(scores, links, entity_ids, entity_country, params, threshol
             if f > best_f:
                 best_t, best_f = float(t), f
         out[country] = best_t
+    return out, pd.DataFrame(rows)
+
+
+def tune_per_country_source(scores, links, entity_ids, entity_country, params,
+                            thresholds=None, rounds=2):
+    """Separate thresholds for Source 2 and Source 3 candidates of each country.
+    Starts from params["country_thresholds"] (or the global threshold) and does
+    coordinate descent: best S2 threshold with S3 fixed, then S3 with S2 fixed.
+    Returns ({country|S2: t, country|S3: t, ...}, results DataFrame)."""
+    thresholds = DEFAULT_THRESHOLDS if thresholds is None else thresholds
+    base = params.get("country_thresholds") or {}
+    ids = pd.Series(pd.unique(np.asarray(entity_ids)))
+    countries = ids.map(entity_country)
+    out, rows = {}, []
+    for country in sorted(countries.dropna().unique()):
+        c_ids = ids[countries == country]
+        c_set = set(c_ids)
+        c_scores = scores[scores["s1_entity_id"].isin(c_set)].copy()
+        c_scores["country"] = country
+        c_links = links[links["source1_entity_id"].isin(c_set)]
+        start = base.get(country, params["threshold"])
+        cur = {country + "|S2": start, country + "|S3": start}
+
+        def score_of(th):
+            m = select_matches(c_scores, params["threshold"], params["one_owner"],
+                               params["top1_threshold"], th)
+            return f05_macro(m, c_links, c_ids)[0]
+
+        best_f = score_of(cur)
+        for _ in range(rounds):
+            for key in (country + "|S2", country + "|S3"):
+                for t in thresholds:
+                    trial = dict(cur, **{key: float(t)})
+                    f = score_of(trial)
+                    rows.append({"country": country, "key": key, "threshold": float(t),
+                                 "f05": f})
+                    if f > best_f + 1e-9:
+                        best_f, cur = f, trial
+        out.update(cur)
     return out, pd.DataFrame(rows)
