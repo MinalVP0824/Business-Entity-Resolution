@@ -4,5 +4,4 @@
 |---|---|---|---|---|---|
 | 1 | 25 Sep 2026, 9:36 PM | 0.9180 | 0.909 | 99e61783bb7d29cebf45dd45f244db1c913349f2 | Baseline: normalize v1, blocking v1 (5 passes, max 200 cands), LightGBM (693 rounds), threshold 0.65, one-owner rule. Val: India 0.8854, US 0.9394. Trained on 100k train S1 sample. |
 | 2 | 26 Sep 2026, 3:55 PM | 0.9199 | 0.911 | 04487bb673792074bf6a97ded2b6d4266bbd8556 | Run 2: same pipeline as #1, trained on 150k train S1 entities (vs 100k), per-country thresholds (india 0.65, us 0.7), saves test_scores.parquet. Val: India 0.8875, US 0.9411. |
-| 3 | 26 Sep 26, 07:40 PM | run 3 | a24bb1a9bb2e2aac8971e0b3f09fb39597915aaa | Transliteration + leetspeak fixes, 2 new blocking passes (address pairs, all address numbers), containment features | 0.9382 | 0.928 |
-a24bb1a9bb2e2aac8971e0b3f09fb39597915aaa
+| 3 | 26 Sep 2026, 7:40 PM | 0.9382 | 0.928 | a24bb1a9bb2e2aac8971e0b3f09fb39597915aaa | Run 3: normalize v2 (Indic transliteration, leetspeak fixes, state variants), blocking v2 (+2 passes: address word pairs, all address numbers), new features (no-space name similarity, address containment, number subset). Official validator re-run separately: PASS. |
