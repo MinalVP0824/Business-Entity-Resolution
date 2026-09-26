@@ -81,7 +81,18 @@ def _with_codes(states):
     return out
 
 
-STATE_MAPS = {"us": _with_codes(US_STATES), "india": _with_codes(INDIA_STATES)}
+def _with_translit(states):
+    """Also accept state names without their final 'a' ("maharashtr",
+    "telangan"), which is how transliterated Indian-script names come out."""
+    out = dict(states)
+    for name, code in states.items():
+        if name.endswith("a") and len(name) > 4:
+            out.setdefault(name[:-1], code)
+    return out
+
+
+STATE_MAPS = {"us": _with_codes(US_STATES),
+              "india": _with_codes(_with_translit(INDIA_STATES))}
 
 # Name abbreviations (applied token by token).
 NAME_ABBREV = {
@@ -96,6 +107,8 @@ NAME_ABBREV = {
     "engg": "engineering", "grp": "group", "hldgs": "holdings",
     "inds": "industries", "ent": "enterprises", "entp": "enterprises",
     "tech": "technology", "techs": "technologies", "tradg": "trading",
+    "praivet": "private", "praibhet": "private", "prayivet": "private",
+    "limitted": "limited", "kampani": "company", "kanpani": "company",
 }
 
 # Removed when building name_core.
@@ -210,9 +223,71 @@ def strip_accents(text):
     return "".join(out)
 
 
+# ============================================================ Indian scripts
+# Names and addresses sometimes appear in Devanagari, Gujarati, Odia, Telugu,
+# Bengali, Tamil, Kannada, Malayalam or Gurmukhi. We romanise them using only
+# the Unicode character NAMES that ship with Python (unicodedata), e.g.
+# "DEVANAGARI LETTER PA" -> "pa". No external data or library is used.
+
+_INDIC = re.compile(r"[\u0900-\u0DFF]")
+_INDIC_VOWELS = {"A": "a", "AA": "a", "I": "i", "II": "i", "U": "u", "UU": "u",
+                 "E": "e", "EE": "e", "AI": "ai", "O": "o", "OO": "o", "AU": "au",
+                 "VOCALIC R": "ri", "VOCALIC RR": "ri", "VOCALIC L": "li",
+                 "SHORT E": "e", "SHORT O": "o", "CANDRA E": "e", "CANDRA O": "o"}
+_INDIC_CONS = {"TTA": "t", "TTHA": "th", "DDA": "d", "DDHA": "dh", "NNA": "n",
+               "SSA": "sh", "SHA": "sh", "LLA": "l", "RRA": "r", "NNNA": "n",
+               "LLLA": "l", "NGA": "n", "NYA": "n", "CA": "ch", "CHA": "chh"}
+_SCHWA_END = re.compile(r"\b(\w{2,}?[^aeiou\s\d])a\b")
+
+
+def transliterate_indic(text):
+    """Romanise Indian-script letters; other characters pass through."""
+    if not _INDIC.search(text):
+        return text
+    out, prev_cons = [], False
+    for ch in text:
+        if not ("\u0900" <= ch <= "\u0DFF"):
+            out.append(ch)
+            prev_cons = False
+            continue
+        try:
+            name = unicodedata.name(ch)
+        except ValueError:
+            continue
+        part = name.split(" ", 1)[1] if " " in name else name
+        if part.startswith("LETTER "):
+            letter = part[7:]
+            if letter in _INDIC_VOWELS:
+                out.append(_INDIC_VOWELS[letter])
+                prev_cons = False
+            else:
+                base = _INDIC_CONS.get(letter, letter[:-1].lower()
+                                       if letter.endswith("A") else letter.lower())
+                out.append(base + "a")          # consonant with inherent 'a'
+                prev_cons = True
+        elif part.startswith("VOWEL SIGN ") or part.startswith("SIGN VIRAMA"):
+            if prev_cons and out and out[-1].endswith("a"):
+                out[-1] = out[-1][:-1]          # vowel sign / virama replaces the 'a'
+            if part.startswith("VOWEL SIGN "):
+                out.append(_INDIC_VOWELS.get(part[11:], ""))
+            prev_cons = False
+        elif part.startswith(("SIGN ANUSVARA", "SIGN CANDRABINDU")):
+            out.append("n")
+            prev_cons = False
+        elif part.startswith("SIGN VISARGA"):
+            out.append("h")
+            prev_cons = False
+        elif part.startswith("DIGIT "):
+            out.append(str(unicodedata.digit(ch, "")))
+            prev_cons = False
+    # spoken Hindi drops the final inherent 'a' ("limiteda" -> "limited")
+    return _SCHWA_END.sub(r"\1", "".join(out))
+
+
 def _base_clean(text):
-    """Lowercase, remove accents, turn '&' into 'and', drop apostrophes."""
-    text = strip_accents(str(text).lower())
+    """Romanise Indian scripts, lowercase, remove accents, turn '&' into 'and',
+    drop apostrophes."""
+    text = strip_accents(transliterate_indic(str(text)).lower())
     text = text.replace("&", " and ").replace("'", "").replace("\u2019", "")
     return _DOTTED_LETTER.sub(r"\1", text)
 
@@ -233,6 +308,19 @@ def _strip_zeros(tok):
 
 # ================================================================== names
 
+_LEET = str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "7": "t"})
+_LEET_TOKEN = re.compile(r"^[a-z]+[0-9][a-z0-9]*$")
+
+
+def _fix_leet(tok):
+    """Digits typed for letters inside a word: 'techn0logy' -> 'technology',
+    's0lutions' -> 'solutions'. Only for tokens that start with at least one
+    letter and contain at least 3 letters, so '3m' or 'b2' stay unchanged."""
+    if _LEET_TOKEN.match(tok) and sum(ch.isalpha() for ch in tok) >= 3:
+        return tok.translate(_LEET)
+    return tok
+
+
 def normalize_name(name):
     """Returns (name_norm, name_core)."""
     text = _base_clean(name)
@@ -242,6 +330,7 @@ def normalize_name(name):
 
     tokens = []
     for tok in text.split():
+        tok = _fix_leet(tok)
         mapped = NAME_ABBREV.get(tok, tok)
         tokens.extend(mapped.split())
     tokens = _dedupe_consecutive(tokens)
