@@ -201,6 +201,11 @@ _DOTTED_LETTER = re.compile(r"\b([a-z])\.")
 _DOMAIN = re.compile(r"\b(?:https?://)?(?:www\.)?([a-z0-9-]+)\."
                      r"(?:co\.in|com|in|net|org|co|biz|info|fr|us)\b")
 _MS_PREFIX = re.compile(r"\bm\s*/\s*s\b")
+# Record ids pasted into names: "(ID: 81383)", "id#4521", "id 77"
+_NAME_ID = re.compile(r"\bid\s*[:#.\-]?\s*\d+")
+# Numbers of 5+ digits in a name are phone numbers / reference codes
+# ("Element Marketing - 8731858442", "Partners #71910"), not part of the name.
+NAME_MAX_DIGITS = 4
 _CARE_OF = re.compile(r"\b[cs]\s*/\s*o\b")
 _NA = re.compile(r"\bn\s*/\s*a\b")
 _ORDINAL = re.compile(r"\b(\d+)(?:st|nd|rd|th)\b")
@@ -326,10 +331,13 @@ def normalize_name(name):
     text = _base_clean(name)
     text = _DOMAIN.sub(r" \1 ", text)
     text = _MS_PREFIX.sub(" ", text)
+    text = _NAME_ID.sub(" ", text)
     text = _NON_ALNUM.sub(" ", text)
 
     tokens = []
     for tok in text.split():
+        if tok.isdigit() and len(tok) > NAME_MAX_DIGITS:
+            continue
         tok = _fix_leet(tok)
         mapped = NAME_ABBREV.get(tok, tok)
         tokens.extend(mapped.split())
