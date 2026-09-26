@@ -25,9 +25,11 @@ FEATURES = [
     "name_ratio", "name_tsort", "name_tset", "name_partial", "name_jw",
     "name_full_tset", "name_exact", "name_tok_jacc", "name_first_eq",
     "name_len_diff", "name_ntok_a", "name_ntok_b",
+    "name_nospace_ratio", "name_nospace_partial",
     # addresses
     "addr_ratio", "addr_tsort", "addr_tset", "addr_partial",
-    "addr_empty_a", "addr_empty_b",
+    "addr_empty_a", "addr_empty_b", "addr_contain_a", "addr_contain_b",
+    "num_subset_b",
     # numbers / postcode / state
     "num_jacc", "num_common", "num_long_eq", "num_both", "num_conflict",
     "pc_eq", "pc_conflict", "state_eq", "state_conflict",
@@ -36,7 +38,7 @@ FEATURES = [
     "pass_postcode", "pass_addr_pair", "pass_addr_num_all", "n_passes", "cand_is_s3",
     # context within the Source 1 record's candidate list
     "n_cands", "name_tset_rank", "name_tset_gap", "addr_tset_rank",
-    "addr_tset_gap", "combo_rank", "combo_gap",
+    "addr_tset_gap", "combo_rank", "combo_gap", "n_addr_strong", "n_name_strong",
 ]
 
 
@@ -71,6 +73,26 @@ class TextStore:
 def _pairwise(a, b, scorer):
     """Element-wise similarity of two equal-length string lists (C++ speed)."""
     return process.cpdist(a, b, scorer=scorer, workers=-1).astype(np.float32)
+
+
+def _containment(a_texts, b_texts, a_nums, b_nums):
+    """Share of each side's address words found in the other side (handles one
+    address being a truncated version of the other), and whether all of the
+    candidate's numbers appear in the Source 1 address."""
+    n = len(a_texts)
+    ca = np.zeros(n, np.float32)
+    cb = np.zeros(n, np.float32)
+    sub = np.zeros(n, np.int8)
+    for i in range(n):
+        wa, wb = set(a_texts[i].split()), set(b_texts[i].split())
+        if wa and wb:
+            common = len(wa & wb)
+            ca[i] = common / len(wa)
+            cb[i] = common / len(wb)
+        nb = b_nums[i].split()
+        if nb:
+            sub[i] = set(nb) <= set(a_nums[i].split())
+    return ca, cb, sub
 
 
 def _set_features(a_names, b_names, a_nums, b_nums):
@@ -127,6 +149,11 @@ def compute_features(pairs):
     f["name_len_diff"] = np.abs(la - lb)
     f["name_ntok_a"] = pairs["a_name_core"].str.count(" ").to_numpy() + 1
     f["name_ntok_b"] = pairs["b_name_core"].str.count(" ").to_numpy() + 1
+    # names glued together or split differently: "eyecareassociates"
+    an_ns = [x.replace(" ", "") for x in an]
+    bn_ns = [x.replace(" ", "") for x in bn]
+    f["name_nospace_ratio"] = _pairwise(an_ns, bn_ns, fuzz.ratio)
+    f["name_nospace_partial"] = _pairwise(an_ns, bn_ns, fuzz.partial_ratio)
 
     aa, ba = pairs["a_addr_norm"].tolist(), pairs["b_addr_norm"].tolist()
     f["addr_ratio"] = _pairwise(aa, ba, fuzz.ratio)
@@ -135,6 +162,8 @@ def compute_features(pairs):
     f["addr_partial"] = _pairwise(aa, ba, fuzz.partial_ratio)
     f["addr_empty_a"] = pairs["a_addr_norm"].to_numpy() == ""
     f["addr_empty_b"] = pairs["b_addr_norm"].to_numpy() == ""
+    f["addr_contain_a"], f["addr_contain_b"], f["num_subset_b"] = _containment(
+        aa, ba, pairs["a_addr_nums"].tolist(), pairs["b_addr_nums"].tolist())
 
     (f["name_tok_jacc"], f["name_first_eq"], f["num_jacc"], f["num_common"],
      f["num_long_eq"], f["num_both"]) = _set_features(
@@ -164,6 +193,10 @@ def compute_features(pairs):
     f["addr_tset_rank"], f["addr_tset_gap"] = _group_rank(s1, f["addr_tset"])
     combo = f["name_tset"] + f["addr_tset"]
     f["combo_rank"], f["combo_gap"] = _group_rank(s1, combo)
+    # how many of this entity's candidates look strong (a busy building, a chain)
+    g = pd.Series(s1)
+    f["n_addr_strong"] = pd.Series(f["addr_tset"] >= 90).groupby(g).transform("sum").to_numpy()
+    f["n_name_strong"] = pd.Series(f["name_tset"] >= 90).groupby(g).transform("sum").to_numpy()
 
     out = pd.DataFrame({k: np.asarray(f[k]).astype(np.float32) for k in FEATURES})
     return out
