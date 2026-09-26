@@ -17,6 +17,7 @@ Usage (Kaggle):
 
     --skip-test    only train + validate (fast experiments)
     --skip-train   reuse the saved model and tuned parameters
+    --stage2       two-stage re-ranker (see stage2.py); ~2x training time
     --apply-only   no scoring at all: re-apply (new) post-processing settings to
                    the saved test_scores.parquet and rewrite matching_results.tsv
                    (takes a minute; use after changing thresholds)
@@ -45,6 +46,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from features import FEATURES, TextStore, compute_features  # noqa: E402
 from postprocess import f05_macro, select_matches, tune, tune_per_country  # noqa: E402
+from stage2 import SCORE_FEATURES, fold_of, score_group_features  # noqa: E402
 
 START = time.time()
 KEEP_SCORE = 0.02   # test pairs below this score are never kept
@@ -81,6 +83,7 @@ def train(args, model_dir):
     log("features for training pairs ...")
     tr_pairs, Xtr = load_pairs(args.train_cands, store)
     ytr = tr_pairs["label"].to_numpy()
+    tr_s1 = tr_pairs["s1_entity_id"].to_numpy()
     log(f"train pairs: {len(Xtr):,} (positives {ytr.mean():.2%})")
     del tr_pairs
 
@@ -97,20 +100,48 @@ def train(args, model_dir):
         "lambda_l2": 1.0, "num_threads": os.cpu_count(), "verbose": -1,
         "seed": 2026,
     }
-    dtr = lgb.Dataset(Xtr, ytr, feature_name=FEATURES)
-    dva = lgb.Dataset(Xva, yva, reference=dtr)
-    log("training LightGBM ...")
-    model = lgb.train(params, dtr, num_boost_round=args.rounds, valid_sets=[dva],
-                      callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)])
-    model.save_model(os.path.join(model_dir, "model.txt"))
-    del dtr, Xtr
+    def fit(X, y, Xv, yv, names, label):
+        log(f"training LightGBM ({label}) ...")
+        d = lgb.Dataset(X, y, feature_name=names)
+        dv = lgb.Dataset(Xv, yv, reference=d)
+        return lgb.train(params, d, num_boost_round=args.rounds, valid_sets=[dv],
+                         callbacks=[lgb.early_stopping(50), lgb.log_evaluation(200)])
 
-    imp = pd.Series(model.feature_importance("gain"), index=FEATURES).sort_values(ascending=False)
+    nthreads = os.cpu_count()
+    if not args.stage2:
+        model = fit(Xtr, ytr, Xva, yva, FEATURES, "single stage")
+        model.save_model(os.path.join(model_dir, "model.txt"))
+        names = FEATURES
+        va_score = model.predict(Xva, num_threads=nthreads)
+        stage1 = None
+    else:
+        # ---- stage 1: two models on two halves of the training entities, so
+        #      every training pair gets an out-of-fold score
+        fold = fold_of(tr_s1)
+        oof = np.zeros(len(Xtr))
+        stage1 = []
+        for k in (0, 1):
+            m = fit(Xtr[fold == k], ytr[fold == k], Xva, yva, FEATURES, f"stage 1, fold {k}")
+            oof[fold != k] = m.predict(Xtr[fold != k], num_threads=nthreads)
+            m.save_model(os.path.join(model_dir, f"model_stage1_{k}.txt"))
+            stage1.append(m)
+        va_s1 = np.mean([m.predict(Xva, num_threads=nthreads) for m in stage1], axis=0)
+        # ---- stage 2: original features + score-context features
+        Xtr = pd.concat([Xtr.reset_index(drop=True), score_group_features(tr_s1, oof)], axis=1)
+        Xva = pd.concat([Xva.reset_index(drop=True),
+                         score_group_features(va_pairs["s1_entity_id"].to_numpy(), va_s1)], axis=1)
+        names = FEATURES + SCORE_FEATURES
+        model = fit(Xtr, ytr, Xva, yva, names, "stage 2")
+        model.save_model(os.path.join(model_dir, "model.txt"))
+        va_score = model.predict(Xva, num_threads=nthreads)
+    del Xtr
+
+    imp = pd.Series(model.feature_importance("gain"), index=names).sort_values(ascending=False)
     print("\nTop features by gain:")
     print((imp / imp.sum()).head(15).round(3).to_string())
 
     # --------------------------------------------------- validation + tuning
-    va_pairs["score"] = model.predict(Xva, num_threads=os.cpu_count())
+    va_pairs["score"] = va_score
     va_scores = va_pairs[["s1_entity_id", "candidate_entity_id", "score", "label"]].copy()
     va_scores["country"] = va_scores["s1_entity_id"].map(s1_country)
     va_scores.to_parquet(os.path.join(model_dir, "val_scores.parquet"), index=False)
@@ -155,10 +186,11 @@ def train(args, model_dir):
     print(f"  {'ALL':<8} F0.5 {f:.4f}  precision {p:.4f}  recall {r:.4f}")
 
     best["val_f05"] = f
+    best["stage2"] = bool(args.stage2)
     with open(os.path.join(model_dir, "params.json"), "w") as fh:
         json.dump(best, fh, indent=2)
     log(f"saved model and params to {model_dir}")
-    return model, best
+    return (model, stage1), best
 
 
 # ================================================================ outputs
@@ -201,7 +233,12 @@ def predict_test(args, model, best, model_dir):
             pairs = pd.read_parquet(path)
             pairs = store.attach(pairs)
             X = compute_features(pairs)
-            pairs["score"] = model.predict(X, num_threads=os.cpu_count())
+            final, stage1 = model
+            if stage1:
+                s1 = np.mean([m.predict(X, num_threads=os.cpu_count()) for m in stage1], axis=0)
+                X = pd.concat([X, score_group_features(pairs["s1_entity_id"].to_numpy(), s1)],
+                              axis=1)
+            pairs["score"] = final.predict(X, num_threads=os.cpu_count())
             kept.append(pairs.loc[pairs["score"] >= KEEP_SCORE,
                                   ["s1_entity_id", "candidate_entity_id", "score"]])
             for s1, grp in pairs.groupby("s1_entity_id", sort=False)["candidate_entity_id"]:
@@ -255,6 +292,9 @@ def main():
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument("--skip-test", action="store_true")
     parser.add_argument("--apply-only", action="store_true")
+    parser.add_argument("--stage2", action="store_true",
+                        help="two-stage model: out-of-fold stage-1 scores + score-context "
+                             "features feed a second LightGBM (re-ranker)")
     args = parser.parse_args()
 
     model_dir = os.path.join(args.work_dir, "model")
@@ -266,9 +306,13 @@ def main():
         return
 
     if args.skip_train:
-        model = lgb.Booster(model_file=os.path.join(model_dir, "model.txt"))
         with open(os.path.join(model_dir, "params.json")) as fh:
             best = json.load(fh)
+        stage1 = None
+        if best.get("stage2"):
+            stage1 = [lgb.Booster(model_file=os.path.join(model_dir, f"model_stage1_{k}.txt"))
+                      for k in (0, 1)]
+        model = (lgb.Booster(model_file=os.path.join(model_dir, "model.txt")), stage1)
         log(f"loaded model and params: {best}")
     else:
         if not (args.train_cands and args.val_cands):
