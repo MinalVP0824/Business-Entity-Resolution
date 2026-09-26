@@ -48,7 +48,7 @@ class TextStore:
     def __init__(self, norm_dir, split):
         cols = ["entity_id"] + TEXT_COLS
         self.s1 = pd.read_parquet(os.path.join(norm_dir, f"{split}_source1.parquet"),
-                                  columns=cols).set_index("entity_id")
+                                  columns=cols + ["country"]).set_index("entity_id")
         self.s23 = pd.concat(
             [pd.read_parquet(os.path.join(norm_dir, f"{split}_source{i}.parquet"),
                              columns=cols) for i in (2, 3)],
