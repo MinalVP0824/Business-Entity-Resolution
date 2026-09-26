@@ -19,7 +19,7 @@ cross countries, so each country's threshold can be optimised on its own.
 import numpy as np
 import pandas as pd
 
-DEFAULT_THRESHOLDS = np.round(np.arange(0.2, 0.96, 0.05), 2)
+DEFAULT_THRESHOLDS = np.round(np.arange(0.3, 0.931, 0.025), 3)
 
 
 def _row_thresholds(scores, threshold, country_thresholds):
@@ -76,7 +76,7 @@ def f05_macro(matches, links, entity_ids):
 
 
 def tune(scores, links, entity_ids, thresholds=None, top1_options=(None, 0.1, 0.2, 0.3),
-         one_owner_options=(True, False)):
+         one_owner_options=(True,)):
     """Grid search of the global settings on validation.
     Returns (best_params, results DataFrame)."""
     thresholds = DEFAULT_THRESHOLDS if thresholds is None else thresholds
