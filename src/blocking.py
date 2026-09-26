@@ -1,9 +1,9 @@
 """
 blocking.py
-Candidate generation (blocking) for Business Entity Resolution, version 1.
+Candidate generation (blocking) for Business Entity Resolution.
 
 For every Source 1 record it finds a shortlist of Source 2 / Source 3 records
-that could be the same business, using five cheap "key" passes. Two records
+that could be the same business, using cheap "key" passes. Two records
 become a candidate pair when they share at least one key. All keys include the
 country, so records are only ever compared within the same country.
 
@@ -15,6 +15,11 @@ Passes (bit value in the `passes` column):
     16 postcode     postcode + rare name word, postcode + number (India PIN, FR/US codes)
     32 addr_pair    pairs of rare address words, no number       (house number missing)
     64 addr_num_all house number + any address word              (truncated addresses)
+    128 name_nospace whole name with spaces removed, and its first 8 letters
+                    ("eye care associates" = "eyecare associates"; typos late in the name)
+    256 addr_prefix house number + 5-letter prefix of a rare address word, and
+                    pairs of such prefixes (typos in street / area names)
+    (128 and 256 only with --typo-passes)
     (the Source 1 side uses more address words than the index side, so a long
      address can still meet a short version of itself; --no-new-passes = v1)
 
@@ -46,8 +51,8 @@ import pandas as pd
 START = time.time()
 
 PASS_BITS = {"name_pair": 1, "name_rare": 2, "name_prefix": 4, "addr": 8, "postcode": 16,
-             "addr_pair": 32, "addr_num_all": 64}
-POPCOUNT = np.array([bin(i).count("1") for i in range(128)], dtype=np.int8)
+             "addr_pair": 32, "addr_num_all": 64, "name_nospace": 128, "addr_prefix": 256}
+POPCOUNT = np.array([bin(i).count("1") for i in range(512)], dtype=np.int8)
 
 # Address words too common to identify a place on their own.
 GENERIC_ADDR = {
@@ -146,6 +151,33 @@ def record_keys(c, name_core, addr_norm, addr_nums, postcode, freqs, cfg, query=
                 keys.append("ad|" + c + "|" + n + "|" + t)
                 bits.append(64)
 
+    if cfg.typo_passes:
+        # ---- name with spaces removed: glued / split words, and typos that
+        #      come after the 8th letter
+        glued = name_core.replace(" ", "")
+        if len(glued) >= 6:
+            keys.append("ns|" + c + "|" + glued)
+            bits.append(128)
+        if len(glued) >= 10:
+            keys.append("n8|" + c + "|" + glued[:8])
+            bits.append(128)
+
+        # ---- 5-letter prefixes of the rarest address words. Words the index
+        #      has never seen count as rarest (df 0): that is usually the word
+        #      with the typo, and its prefix is often still correct.
+        raw = {t for t in addr_norm.split()
+               if len(t) >= 5 and not t.isdigit() and t not in GENERIC_ADDR}
+        pw = sorted(raw, key=lambda t: (addr_df.get(c + "|" + t, 0), t))
+        pref = sorted({t[:5] for t in pw[:cfg.prefix_words]})
+        for n in nums[:2]:
+            for p in pref:
+                keys.append("ax|" + c + "|" + n + "|" + p)
+                bits.append(256)
+        for a in range(len(pref)):
+            for b in range(a + 1, len(pref)):
+                keys.append("aq|" + c + "|" + pref[a] + "|" + pref[b])
+                bits.append(256)
+
     # ---- postcode
     if postcode:
         if rare:
@@ -159,7 +191,7 @@ def record_keys(c, name_core, addr_norm, addr_nums, postcode, freqs, cfg, query=
 
 
 def build_keys(df, freqs, cfg, chunk=500_000, label="", query=False):
-    """Returns hashed keys (uint64), row ids (int32) and pass bits (int8)."""
+    """Returns hashed keys (uint64), row ids (int32) and pass bits (int16)."""
     key_parts, row_parts, bit_parts = [], [], []
     cols = [df[c].tolist() for c in ["country", "name_core", "addr_norm", "addr_nums", "postcode"]]
     n = len(df)
@@ -175,12 +207,12 @@ def build_keys(df, freqs, cfg, chunk=500_000, label="", query=False):
         if ks:
             key_parts.append(pd.util.hash_array(np.array(ks, dtype=object)))
             row_parts.append(np.array(rs, dtype=np.int32))
-            bit_parts.append(np.array(bs, dtype=np.int8))
+            bit_parts.append(np.array(bs, dtype=np.int16))
         if label:
             log(f"  {label}: keys for {stop:,}/{n:,} records")
     if not key_parts:
         return (np.array([], dtype=np.uint64), np.array([], dtype=np.int32),
-                np.array([], dtype=np.int8))
+                np.array([], dtype=np.int16))
     return np.concatenate(key_parts), np.concatenate(row_parts), np.concatenate(bit_parts)
 
 
@@ -208,7 +240,7 @@ class KeyIndex:
         total = int(lens.sum())
         if total == 0:
             return (np.array([], dtype=np.int64), np.array([], dtype=np.int64),
-                    np.array([], dtype=np.int8))
+                    np.array([], dtype=np.int16))
         starts = np.cumsum(lens) - lens
         offsets = np.arange(total, dtype=np.int64) - np.repeat(starts, lens)
         idx = np.repeat(left, lens) + offsets
@@ -223,7 +255,7 @@ def combine_pairs(q, cand, bits, n_index, max_cands):
     """Unique (query, candidate) pairs with OR-ed pass bits, capped per query."""
     pairs = pd.DataFrame({"code": q * n_index + cand, "bit": bits})
     pairs = pairs.drop_duplicates()
-    agg = pairs.groupby("code", sort=False)["bit"].sum().astype(np.int8)
+    agg = pairs.groupby("code", sort=False)["bit"].sum().astype(np.int16)
     code = agg.index.to_numpy()
     out = pd.DataFrame({"q": code // n_index, "c": code % n_index,
                         "passes": agg.to_numpy()})
@@ -311,6 +343,11 @@ def main():
     parser.add_argument("--pair-words-query", type=int, default=6)
     parser.add_argument("--num-words-index", type=int, default=8)
     parser.add_argument("--num-words-query", type=int, default=12)
+    parser.add_argument("--typo-passes", action="store_true",
+                        help="add passes 128 (name without spaces) and 256 (address "
+                             "word prefixes)")
+    parser.add_argument("--prefix-words", type=int, default=3,
+                        help="rare address words whose prefixes the typo pass uses")
     parser.add_argument("--seed", type=int, default=2026)
     cfg = parser.parse_args()
 
