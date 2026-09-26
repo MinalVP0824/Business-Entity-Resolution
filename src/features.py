@@ -35,7 +35,8 @@ FEATURES = [
     "pc_eq", "pc_conflict", "state_eq", "state_conflict",
     # blocking + source
     "pass_name_pair", "pass_name_rare", "pass_name_prefix", "pass_addr",
-    "pass_postcode", "pass_addr_pair", "pass_addr_num_all", "n_passes", "cand_is_s3",
+    "pass_postcode", "pass_addr_pair", "pass_addr_num_all", "pass_name_nospace",
+    "pass_addr_prefix", "n_passes", "cand_is_s3",
     # context within the Source 1 record's candidate list
     "n_cands", "name_tset_rank", "name_tset_gap", "addr_tset_rank",
     "addr_tset_gap", "combo_rank", "combo_gap", "n_addr_strong", "n_name_strong",
@@ -182,7 +183,8 @@ def compute_features(pairs):
     passes = pairs["passes"].to_numpy().astype(np.int16)
     for name, bit in [("pass_name_pair", 1), ("pass_name_rare", 2),
                       ("pass_name_prefix", 4), ("pass_addr", 8), ("pass_postcode", 16),
-                      ("pass_addr_pair", 32), ("pass_addr_num_all", 64)]:
+                      ("pass_addr_pair", 32), ("pass_addr_num_all", 64),
+                      ("pass_name_nospace", 128), ("pass_addr_prefix", 256)]:
         f[name] = (passes & bit) > 0
     f["n_passes"] = pairs["n_passes"].to_numpy()
     f["cand_is_s3"] = pairs["candidate_entity_id"].str.startswith("S3-").to_numpy()
