@@ -13,6 +13,10 @@ Passes (bit value in the `passes` column):
     4  name_prefix  4-letter prefixes of the two rarest words    (typos after the 4th letter)
     8  addr         house/flat number + a rare address word      (name changed, address same)
     16 postcode     postcode + rare name word, postcode + number (India PIN, FR/US codes)
+    32 addr_pair    pairs of rare address words, no number       (house number missing)
+    64 addr_num_all house number + any address word              (truncated addresses)
+    (the Source 1 side uses more address words than the index side, so a long
+     address can still meet a short version of itself; --no-new-passes = v1)
 
 Keys shared by more than --max-block index records are dropped as too common.
 
@@ -41,8 +45,9 @@ import pandas as pd
 
 START = time.time()
 
-PASS_BITS = {"name_pair": 1, "name_rare": 2, "name_prefix": 4, "addr": 8, "postcode": 16}
-POPCOUNT = np.array([bin(i).count("1") for i in range(32)], dtype=np.int8)
+PASS_BITS = {"name_pair": 1, "name_rare": 2, "name_prefix": 4, "addr": 8, "postcode": 16,
+             "addr_pair": 32, "addr_num_all": 64}
+POPCOUNT = np.array([bin(i).count("1") for i in range(128)], dtype=np.int8)
 
 # Address words too common to identify a place on their own.
 GENERIC_ADDR = {
@@ -81,8 +86,10 @@ def count_frequencies(df):
 
 # ================================================================== keys
 
-def record_keys(c, name_core, addr_norm, addr_nums, postcode, freqs, cfg):
-    """Returns (keys, bits) for one record."""
+def record_keys(c, name_core, addr_norm, addr_nums, postcode, freqs, cfg, query=False):
+    """Returns (keys, bits) for one record.
+    query=True (Source 1 side) generates more address keys than the index side,
+    so a long, complete address can still meet a short, truncated one."""
     name_df, prefix_df, addr_df = freqs
     keys, bits = [], []
 
@@ -111,12 +118,33 @@ def record_keys(c, name_core, addr_norm, addr_nums, postcode, freqs, cfg):
     nums = sorted(addr_nums.split(), key=lambda n: (-len(n), n))[:cfg.max_nums]
     words = {t for t in addr_norm.split()
              if len(t) >= 3 and not t.isdigit() and t not in GENERIC_ADDR}
-    words = sorted((t for t in words if addr_df.get(c + "|" + t, 0) > 0),
-                   key=lambda t: (addr_df[c + "|" + t], t))[:2]
+    all_words = sorted((t for t in words if addr_df.get(c + "|" + t, 0) > 0),
+                       key=lambda t: (addr_df[c + "|" + t], t))
+    words = all_words[:2]
     for n in nums:
         for t in words:
             keys.append("ad|" + c + "|" + n + "|" + t)
             bits.append(8)
+
+    if not cfg.no_new_passes:
+        # ---- address word pairs, no number needed (house number missing on
+        #      one side). Pairs among the rarest words; the query side uses
+        #      more words so its pairs cover a shorter version of the address.
+        k = cfg.pair_words_query if query else cfg.pair_words_index
+        top = all_words[:k]
+        for a in range(len(top)):
+            for b in range(a + 1, len(top)):
+                x, y = (top[a], top[b]) if top[a] < top[b] else (top[b], top[a])
+                keys.append("aw|" + c + "|" + x + "|" + y)
+                bits.append(32)
+
+        # ---- number + ANY address word (not only the two rarest): catches
+        #      truncated addresses such as "79 ahmedabad gj" vs a long version.
+        k = cfg.num_words_query if query else cfg.num_words_index
+        for n in nums[:2]:
+            for t in all_words[2:k]:
+                keys.append("ad|" + c + "|" + n + "|" + t)
+                bits.append(64)
 
     # ---- postcode
     if postcode:
@@ -130,7 +158,7 @@ def record_keys(c, name_core, addr_norm, addr_nums, postcode, freqs, cfg):
     return keys, bits
 
 
-def build_keys(df, freqs, cfg, chunk=500_000, label=""):
+def build_keys(df, freqs, cfg, chunk=500_000, label="", query=False):
     """Returns hashed keys (uint64), row ids (int32) and pass bits (int8)."""
     key_parts, row_parts, bit_parts = [], [], []
     cols = [df[c].tolist() for c in ["country", "name_core", "addr_norm", "addr_nums", "postcode"]]
@@ -140,7 +168,7 @@ def build_keys(df, freqs, cfg, chunk=500_000, label=""):
         stop = min(start + chunk, n)
         for j in range(start, stop):
             k, b = record_keys(cols[0][j], cols[1][j], cols[2][j], cols[3][j],
-                               cols[4][j], freqs, cfg)
+                               cols[4][j], freqs, cfg, query)
             ks.extend(k)
             bs.extend(b)
             rs.extend([j] * len(k))
@@ -277,6 +305,12 @@ def main():
     parser.add_argument("--max-nums", type=int, default=3)
     parser.add_argument("--max-cands", type=int, default=200)
     parser.add_argument("--query-chunk", type=int, default=200_000)
+    parser.add_argument("--no-new-passes", action="store_true",
+                        help="use only the original five passes (v1 behaviour)")
+    parser.add_argument("--pair-words-index", type=int, default=4)
+    parser.add_argument("--pair-words-query", type=int, default=6)
+    parser.add_argument("--num-words-index", type=int, default=8)
+    parser.add_argument("--num-words-query", type=int, default=12)
     parser.add_argument("--seed", type=int, default=2026)
     cfg = parser.parse_args()
 
@@ -329,7 +363,7 @@ def main():
     total_capped = 0
     for part_no, start in enumerate(range(0, len(queries), cfg.query_chunk)):
         chunk = queries.iloc[start:start + cfg.query_chunk].reset_index(drop=True)
-        qkeys, qrows, qbits = build_keys(chunk, freqs, cfg)
+        qkeys, qrows, qbits = build_keys(chunk, freqs, cfg, query=True)
         q, c, bits = index.lookup(qkeys, qrows, qbits)
         pairs, capped = combine_pairs(q, c, bits, n_index, cfg.max_cands)
         total_capped += capped
