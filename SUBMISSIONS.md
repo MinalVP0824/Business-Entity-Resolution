@@ -10,3 +10,4 @@
 | 6 | 27 Sep 2026, <time> | 0.9624 (half B) | 0.949 | 0aca892 | Run 7 + cross-encoder (top 20), blend 0.6 LightGBM + 0.4 cross-encoder. Run 7 = typo-tolerant blocking + similarity-to-best-candidate features + per-country/source thresholds + IDs/phone numbers stripped from names (val 0.9534). Half-B: 0.9532 -> 0.9624. |
 | 7 | 27 Sep 2026, 11:10 AM | – | 0.950782 | 7de15d9 | Submission 6 with France threshold 0.8 (France has no training data; it used the global 0.6). India/US predictions unchanged. |
 | 8 | 27 Sep 2026, 11:16 AM | – | 0.950913 | 7de15d9 | **FINAL.** Submission 6 with France threshold 0.9. |
+| 9 | 27 Sep 2026, 12:46 PM | – | 0.950 | 0389b96 | Submission 6 with France threshold 0.95: lower than 0.9, so 0.9 stays final. |
