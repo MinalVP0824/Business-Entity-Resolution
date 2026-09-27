@@ -55,7 +55,8 @@ from stage2 import (SCORE_FEATURES, TRANSITIVE_FEATURES, fold_of,  # noqa: E402
                     score_group_features, transitive_features)
 
 START = time.time()
-KEEP_SCORE = 0.02   # test pairs below this score are never kept
+KEEP_SCORE = 0.02   # LightGBM filter: pairs below this score are dropped before the
+                    # final matching step (and are not in candidate_pairs.tsv)
 
 
 def log(msg):
@@ -276,14 +277,18 @@ def predict_test(args, model, best, model_dir):
                 X = pd.concat([X, stage2_extra(pairs, s1, best.get("transitive", False))],
                               axis=1)
             pairs["score"] = final.predict(X, num_threads=os.cpu_count())
-            kept.append(pairs.loc[pairs["score"] >= KEEP_SCORE,
-                                  ["s1_entity_id", "candidate_entity_id", "score"]])
-            for s1, grp in pairs.groupby("s1_entity_id", sort=False)["candidate_entity_id"]:
+            keep = pairs.loc[pairs["score"] >= KEEP_SCORE,
+                             ["s1_entity_id", "candidate_entity_id", "score"]]
+            kept.append(keep)
+            # candidate_pairs.tsv = the pairs the final matching step runs on:
+            # blocking candidates that pass the LightGBM filter (score >= KEEP_SCORE)
+            keep = keep.sort_values(["s1_entity_id", "score"], ascending=[True, False])
+            for s1, grp in keep.groupby("s1_entity_id", sort=False)["candidate_entity_id"]:
                 fh.write(f"{s1}\t{','.join(pd.unique(grp))}\n")
                 seen.add(s1)
             log(f"test part {n + 1}: {len(pairs):,} pairs scored")
             del pairs, X
-        for s1 in all_s1:                      # entities blocking found nothing for
+        for s1 in all_s1:                      # entities with no candidate left
             if s1 not in seen:
                 fh.write(f"{s1}\t\n")
     log(f"wrote {cand_path}")
