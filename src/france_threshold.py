@@ -72,8 +72,14 @@ def main():
     with open(find(args.ce_dir, "ce_params.json")) as fh:
         p = json.load(fh)
     test = pd.read_parquet(find(args.run_dir, "test_scores.parquet"))
-    ce = pd.read_parquet(find(args.ce_dir, "ce_test_scores.parquet"))
-    scores = blend(test, ce, p["w_lgb"])
+    ce_path = glob.glob(os.path.join(args.ce_dir, "**", "ce_test_scores.parquet"),
+                        recursive=True)
+    if ce_path:
+        scores = blend(test, pd.read_parquet(sorted(ce_path)[0]), p["w_lgb"])
+    else:   # the cross-encoder did not help on validation (w_lgb = 1): LightGBM only
+        if p["w_lgb"] != 1.0:
+            raise FileNotFoundError(f"ce_test_scores.parquet not found under {args.ce_dir}")
+        scores = test[["s1_entity_id", "candidate_entity_id", "score", "country"]].copy()
     all_s1 = pd.read_csv(os.path.join(args.data_dir, "test", "test_source1.tsv"), sep="\t",
                          dtype=str, keep_default_na=False, usecols=["entity_id"])["entity_id"]
     ct = dict(p.get("country_thresholds") or {})
